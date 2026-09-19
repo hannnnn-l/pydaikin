@@ -1926,3 +1926,186 @@ async def test_get_resource_http_error(aresponses, client_session):
     device = DaikinBRP084('ip', session=client_session)
     with pytest.raises(ClientResponseError):
         await device._get_resource("")
+
+
+def _diagnostic_response(outdoor=None, indoor=None):
+    """Build a multireq response holding only the given diagnostic entities.
+
+    ``outdoor`` / ``indoor`` map an entity name (e.g. "e_2006") to a dict of
+    property name -> value, placed under e_1003 / e_1002 respectively.
+    """
+
+    def entities(mapping):
+        return [
+            {"pn": ent, "pch": [{"pn": pn, "pv": pv} for pn, pv in props.items()]}
+            for ent, props in (mapping or {}).items()
+        ]
+
+    return {
+        "responses": [
+            {
+                "fr": "/dsiot/edge/adr_0100.dgc_status",
+                "pc": {
+                    "pn": "dgc_status",
+                    "pch": [{"pn": "e_1002", "pch": entities(indoor)}],
+                },
+            },
+            {
+                "fr": "/dsiot/edge/adr_0200.dgc_status",
+                "pc": {
+                    "pn": "dgc_status",
+                    "pch": [{"pn": "e_1003", "pch": entities(outdoor)}],
+                },
+            },
+        ]
+    }
+
+
+def test_extract_diagnostic_readings():
+    """Compressor and refrigerant-circuit values decode from FTXM71 samples."""
+    device = DaikinBRP084("127.0.0.1", session=MagicMock())
+    device.values["mode"] = "cool"
+    response = _diagnostic_response(
+        outdoor={
+            "e_2006": {"p_01": "01", "p_04": "3400", "p_0B": "8C00", "p_25": "FFFF"},
+            "e_2005": {"p_01": "E001"},
+            "e_2008": {"p_01": "0700"},
+        },
+        indoor={
+            "e_2015_02": {"p_02": "3802", "p_03": "2803"},
+            "e_3003": {"p_0C": "36"},
+        },
+    )
+
+    device._extract_diagnostic_readings(response)
+
+    assert device.values["cmpfreq"] == "52"
+    assert device.support_compressor_frequency is True
+    assert device.compressor_frequency == 52.0
+    assert device.values["compressor_running"] == "1"
+    assert device.values["outdoor_refrigerant_temp"] == "14.0"
+    assert device.values["outdoor_hx_temp"] == "-0.1"
+    assert device.values["eev_position"] == "480"
+    assert device.values["outdoor_fan_step"] == "7"
+    assert device.values["indoor_coil_outlet_temp"] == "56.8"
+    assert device.values["indoor_coil_inlet_temp"] == "80.8"
+    assert device.values["internal_heat_target"] == "27.0"
+    # Not heating, so no estimate.
+    assert "estimated_indoor_temp" not in device.values
+
+
+def test_extract_diagnostic_readings_compressor_stopped():
+    """A zero run flag maps to '0' and a zero frequency is still reported."""
+    device = DaikinBRP084("127.0.0.1", session=MagicMock())
+    device.values["mode"] = "cool"
+    device._extract_diagnostic_readings(
+        _diagnostic_response(outdoor={"e_2006": {"p_01": "00", "p_04": "0000"}})
+    )
+    assert device.values["compressor_running"] == "0"
+    assert device.values["cmpfreq"] == "0"
+
+
+@pytest.mark.parametrize("raw", [None, "", "12", "zzzz"])
+def test_decode_le_invalid(raw):
+    """Missing, short or non-hex values decode to None."""
+    assert DaikinBRP084._decode_le(raw) is None
+
+
+def test_extract_diagnostic_readings_absent_on_other_models():
+    """Units without these entities leave every diagnostic key unset."""
+    device = DaikinBRP084("127.0.0.1", session=MagicMock())
+    device.values["mode"] = "cool"
+    device._extract_diagnostic_readings(_diagnostic_response())
+    for key in (
+        "cmpfreq",
+        "compressor_running",
+        "outdoor_refrigerant_temp",
+        "outdoor_hx_temp",
+        "eev_position",
+        "outdoor_fan_step",
+        "indoor_coil_inlet_temp",
+        "indoor_coil_outlet_temp",
+        "internal_heat_target",
+        "estimated_indoor_temp",
+    ):
+        assert key not in device.values
+    assert device.support_compressor_frequency is False
+
+
+@pytest.mark.parametrize(
+    "mode, stemp, target, expected",
+    [
+        ("hot", "22.0", "24.0", "22.0"),  # 2 °C bias removed from htemp 24
+        ("hot", "22.0", "22.0", "24.0"),  # no bias
+        ("cool", "22.0", "24.0", None),  # only estimated while heating
+        ("hot", "--", "24.0", None),  # no usable setpoint
+        ("hot", "22.0", None, None),  # internal target not reported
+    ],
+)
+def test_estimate_indoor_temp(mode, stemp, target, expected):
+    """estimated = htemp - (internal_heat_target - stemp), heat mode only."""
+    device = DaikinBRP084("127.0.0.1", session=MagicMock())
+    device.values.update({"mode": mode, "htemp": "24.0", "stemp": stemp})
+    if target is not None:
+        device.values["internal_heat_target"] = target
+    device._estimate_indoor_temp()
+    assert device.values.get("estimated_indoor_temp") == expected
+
+
+def test_estimate_indoor_temp_cleared_when_leaving_heat():
+    """A stale estimate is removed once the unit is no longer heating."""
+    device = DaikinBRP084("127.0.0.1", session=MagicMock())
+    device.values.update(
+        {"mode": "cool", "htemp": "24.0", "stemp": "22.0", "estimated_indoor_temp": "1"}
+    )
+    device._estimate_indoor_temp()
+    assert "estimated_indoor_temp" not in device.values
+
+
+@pytest.mark.asyncio
+async def test_update_status_populates_diagnostics(aresponses, client_session):
+    """update_status wires the diagnostic readings in, including the estimate."""
+    response = _diagnostic_response(
+        outdoor={
+            "e_A00D": {"p_01": "16"},
+            "e_2006": {"p_01": "01", "p_04": "2C00", "p_0B": "8C00", "p_25": "3200"},
+        },
+        indoor={
+            "e_A002": {"p_01": "01"},
+            "e_3001": {
+                "p_01": "0100",  # heat
+                "p_03": "2C",  # setpoint 22 °C
+                "p_0A": "0A00",
+                "p_07": "000000",
+                "p_08": "000000",
+            },
+            "e_A00B": {"p_01": "18", "p_02": "3c"},  # room 24 °C
+            "e_3003": {"p_0C": "30"},  # internal target 24 °C
+        },
+    )
+    response["responses"].append(
+        {
+            "fr": "/dsiot/edge.adp_i",
+            "pc": {"pn": "adp_i", "pch": [{"pn": "mac", "pv": "112233445566"}]},
+        }
+    )
+    aresponses.add(
+        path_pattern="/dsiot/multireq",
+        method_pattern="POST",
+        response=aresponses.Response(
+            status=200,
+            text=json.dumps(response),
+            headers={"Content-Type": "application/json"},
+        ),
+    )
+
+    device = DaikinBRP084("ip", session=client_session)
+    await device.init()
+
+    assert device.values["mode"] == "hot"
+    assert device.values["cmpfreq"] == "44"
+    assert device.values["compressor_running"] == "1"
+    assert device.values["outdoor_hx_temp"] == "5.0"
+    assert device.values["internal_heat_target"] == "24.0"
+    assert device.values["estimated_indoor_temp"] == "22.0"
+    aresponses.assert_all_requests_matched()
