@@ -123,19 +123,13 @@ class DaikinBRP084(Appliance):
         "outdoor_model": E_1003_PATH + ["e_A001", "p_01"],
         # Outdoor unit e_2006 (found via setpoint-sweep probing on FTXM71):
         # p_01 = compressor run flag, p_04 = compressor frequency (u16 LE, Hz),
-        # p_0B = refrigerant temp, p_25 = heat-exchanger temp (i16 LE / 10 °C).
+        # p_0B = refrigerant temp (i16 LE / 10 °C).
         "compressor_running": E_1003_PATH + ["e_2006", "p_01"],
         "compressor_frequency": E_1003_PATH + ["e_2006", "p_04"],
         "outdoor_refrigerant_temp": E_1003_PATH + ["e_2006", "p_0B"],
-        "outdoor_hx_temp": E_1003_PATH + ["e_2006", "p_25"],
         # Electronic expansion valve position and outdoor fan step (u16 LE).
         "eev_position": E_1003_PATH + ["e_2005", "p_01"],
         "outdoor_fan_step": E_1003_PATH + ["e_2008", "p_01"],
-        # Indoor coil refrigerant inlet/outlet temps (i16 LE / 10 °C). They
-        # converge when the compressor stops; in heat mode the inlet reads
-        # 20-30 °C above the outlet, in cool mode the relation inverts.
-        "indoor_coil_inlet_temp": E_1002_PATH + ["e_2015_02", "p_03"],
-        "indoor_coil_outlet_temp": E_1002_PATH + ["e_2015_02", "p_02"],
         # Internal compensated heating target (u8 / 2 °C, same encoding as the
         # user setpoints). Observed as setpoint + 3-4 °C on FTXM71; writable
         # but overwritten by the control logic within ~10 s.
@@ -647,15 +641,9 @@ class DaikinBRP084(Appliance):
         if run_flag is not None:
             self.values["compressor_running"] = "1" if run_flag == "01" else "0"
 
-        for key in (
-            "outdoor_refrigerant_temp",
-            "outdoor_hx_temp",
-            "indoor_coil_inlet_temp",
-            "indoor_coil_outlet_temp",
-        ):
-            raw = self._safe_extract(response, *self.get_path(key))
-            if (decoded := self._decode_le(raw, signed=True)) is not None:
-                self.values[key] = str(decoded / 10)
+        raw = self._safe_extract(response, *self.get_path("outdoor_refrigerant_temp"))
+        if (decoded := self._decode_le(raw, signed=True)) is not None:
+            self.values["outdoor_refrigerant_temp"] = str(decoded / 10)
 
         for key in ("eev_position", "outdoor_fan_step"):
             raw = self._safe_extract(response, *self.get_path(key))

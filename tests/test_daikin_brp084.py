@@ -1967,14 +1967,11 @@ def test_extract_diagnostic_readings():
     device.values["mode"] = "cool"
     response = _diagnostic_response(
         outdoor={
-            "e_2006": {"p_01": "01", "p_04": "3400", "p_0B": "8C00", "p_25": "FFFF"},
+            "e_2006": {"p_01": "01", "p_04": "3400", "p_0B": "8C00"},
             "e_2005": {"p_01": "E001"},
             "e_2008": {"p_01": "0700"},
         },
-        indoor={
-            "e_2015_02": {"p_02": "3802", "p_03": "2803"},
-            "e_3003": {"p_0C": "36"},
-        },
+        indoor={"e_3003": {"p_0C": "36"}},
     )
 
     device._extract_diagnostic_readings(response)
@@ -1984,11 +1981,8 @@ def test_extract_diagnostic_readings():
     assert device.compressor_frequency == 52.0
     assert device.values["compressor_running"] == "1"
     assert device.values["outdoor_refrigerant_temp"] == "14.0"
-    assert device.values["outdoor_hx_temp"] == "-0.1"
     assert device.values["eev_position"] == "480"
     assert device.values["outdoor_fan_step"] == "7"
-    assert device.values["indoor_coil_outlet_temp"] == "56.8"
-    assert device.values["indoor_coil_inlet_temp"] == "80.8"
     assert device.values["internal_heat_target"] == "27.0"
     # Not heating, so no estimate.
     assert "estimated_indoor_temp" not in device.values
@@ -2020,11 +2014,8 @@ def test_extract_diagnostic_readings_absent_on_other_models():
         "cmpfreq",
         "compressor_running",
         "outdoor_refrigerant_temp",
-        "outdoor_hx_temp",
         "eev_position",
         "outdoor_fan_step",
-        "indoor_coil_inlet_temp",
-        "indoor_coil_outlet_temp",
         "internal_heat_target",
         "estimated_indoor_temp",
     ):
@@ -2068,7 +2059,7 @@ async def test_update_status_populates_diagnostics(aresponses, client_session):
     response = _diagnostic_response(
         outdoor={
             "e_A00D": {"p_01": "16"},
-            "e_2006": {"p_01": "01", "p_04": "2C00", "p_0B": "8C00", "p_25": "3200"},
+            "e_2006": {"p_01": "01", "p_04": "2C00", "p_0B": "8C00"},
         },
         indoor={
             "e_A002": {"p_01": "01"},
@@ -2105,7 +2096,7 @@ async def test_update_status_populates_diagnostics(aresponses, client_session):
     assert device.values["mode"] == "hot"
     assert device.values["cmpfreq"] == "44"
     assert device.values["compressor_running"] == "1"
-    assert device.values["outdoor_hx_temp"] == "5.0"
+    assert device.values["outdoor_refrigerant_temp"] == "14.0"
     assert device.values["internal_heat_target"] == "24.0"
     assert device.values["estimated_indoor_temp"] == "22.0"
     aresponses.assert_all_requests_matched()
