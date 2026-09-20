@@ -122,6 +122,16 @@ class DaikinBRP084(Appliance):
         # nodes tracked the compressor; not every model exposes e_2006.
         "compressor_running": E_1003_PATH + ["e_2006", "p_01"],
         "compressor_frequency": E_1003_PATH + ["e_2006", "p_04"],
+        # Refrigerant temperature on the same outdoor entity (i16 LE / 10 °C),
+        # plus the electronic expansion valve position and the outdoor fan
+        # step (both u16 LE). Same FTXM71 probing as the compressor nodes.
+        "outdoor_refrigerant_temp": E_1003_PATH + ["e_2006", "p_0B"],
+        "eev_position": E_1003_PATH + ["e_2005", "p_01"],
+        "outdoor_fan_step": E_1003_PATH + ["e_2008", "p_01"],
+        # Internal compensated heating target (u8 / 2 °C, same encoding as the
+        # user setpoints). Observed as setpoint + 3-4 °C on FTXM71; writable
+        # but overwritten by the control logic within ~10 s.
+        "internal_heat_target": E_1002_E_3003_PATH + ["p_0C"],
         # Outdoor unit sensors (read-only)
         "compressor_temp": E_1003_PATH + ["e_A005", "p_01"],
         "discharge_temp": E_1003_PATH + ["e_A005", "p_02"],
@@ -610,6 +620,8 @@ class DaikinBRP084(Appliance):
         if raw is not None:
             self.values["compressor_running"] = "1" if raw == "01" else "0"
 
+        self._extract_local_diagnostics(response)
+
         # Outdoor-unit compressor temperature.
         try:
             self.values['cmp_temp'] = str(
@@ -631,6 +643,63 @@ class DaikinBRP084(Appliance):
                 )
             except DaikinException:
                 pass
+
+    def _extract_local_diagnostics(self, response):
+        """Extract the refrigerant-circuit diagnostics.
+
+        Same provenance as the compressor nodes above: reverse-engineered on
+        an FTXM71 (adapter firmware 3.12.3), absent on other models, so each
+        value is only set when present and decodable.
+        """
+        raw = self._safe_extract(response, *self.get_path("outdoor_refrigerant_temp"))
+        if (decoded := self._decode_le(raw, signed=True)) is not None:
+            self.values["outdoor_refrigerant_temp"] = str(decoded / 10)
+
+        for key in ("eev_position", "outdoor_fan_step"):
+            raw = self._safe_extract(response, *self.get_path(key))
+            if (decoded := self._decode_le(raw)) is not None:
+                self.values[key] = str(decoded)
+
+        raw = self._safe_extract(response, *self.get_path("internal_heat_target"))
+        try:
+            self.values["internal_heat_target"] = str(self.hex_to_temp(raw))
+        except (TypeError, ValueError):
+            pass
+
+        self._estimate_indoor_temp()
+
+    def _estimate_indoor_temp(self):
+        """Estimate real room temperature while heating.
+
+        The indoor sensor is a return-air thermistor that reads several °C
+        above room air; the firmware compensates by aiming for
+        internal_heat_target instead of the user setpoint. Subtracting the
+        same bias from the raw reading approximates room temperature:
+
+            estimated = htemp - (internal_heat_target - stemp)
+
+        Only meaningful in heat mode; the key is absent otherwise.
+        """
+        self.values.pop("estimated_indoor_temp", None)
+        if self.values.get("mode", invalidate=False) != "hot":
+            return
+        try:
+            htemp = float(self.values["htemp"])
+            stemp = float(self.values["stemp"])
+            target = float(self.values["internal_heat_target"])
+        except (KeyError, TypeError, ValueError):
+            return
+        self.values["estimated_indoor_temp"] = str(round(htemp - (target - stemp), 1))
+
+    @classmethod
+    def _decode_le(cls, value, signed: bool = False) -> Optional[int]:
+        """Decode a 2-byte little-endian value, or None if missing/invalid."""
+        if not isinstance(value, str) or len(value) < 4:
+            return None
+        try:
+            return cls.hex_le_to_int(value[:4], signed=signed)
+        except ValueError:
+            return None
 
     async def _get_resource(self, path: str, params: Optional[Dict] = None):
         """Make the HTTP request to the device."""
